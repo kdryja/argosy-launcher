@@ -273,8 +273,19 @@ class SecondaryHomeActivity :
         if (isGameActive && dsm.emulatorDisplayId != null && !dsm.isLaunchingGame) {
             val emulatorPkg = dsm.sessionStateStore.getEmulatorPackage()
             if (emulatorPkg != null) {
-                val helper = com.nendo.argosy.util.PermissionHelper()
-                if (!helper.isPackageInForeground(this, emulatorPkg, withinMs = 15_000)) {
+                // When the emulator shares this companion's (secondary) display -- roles-swapped,
+                // the game runs on this bottom screen -- this activity resuming is itself proof the
+                // emulator was dismissed. Its UsageStats timestamp is necessarily fresh (it was
+                // foreground a moment ago), so an isPackageInForeground() check would wrongly report
+                // it still running and strand the "game running" view until the 30s background
+                // monitor fires. Only fall back to the freshness check when the emulator is on a
+                // different (primary) display, where this resume tells us nothing about it.
+                val emulatorOnThisDisplay =
+                    dsm.emulatorDisplayId != android.view.Display.DEFAULT_DISPLAY
+                val shouldEnd = emulatorOnThisDisplay ||
+                    !com.nendo.argosy.util.PermissionHelper()
+                        .isPackageInForeground(this, emulatorPkg, withinMs = 15_000)
+                if (shouldEnd) {
                     android.util.Log.d("SecondaryHome", "Emulator exited on secondary display, ending session")
                     dsm.emulatorDisplayId = null
                     dsm.playSessionTracker.endSessionInBackground()

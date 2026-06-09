@@ -550,7 +550,16 @@ class MainActivity : ComponentActivity() {
         activityScope.launch {
             if (!::dualScreenManager.isInitialized) return@launch
             if (dualScreenManager.isLaunchingGame) return@launch
-            if (dualScreenManager.emulatorDisplayId != null) {
+            val emulatorDisplayId = dualScreenManager.emulatorDisplayId
+            // Only trust the "emulator still in foreground" check when the emulator is on a
+            // DIFFERENT display than MainActivity (roles-swapped: game on the secondary screen
+            // while the launcher is browsed on the primary). When the emulator shares
+            // MainActivity's display (DEFAULT_DISPLAY -- e.g. an external emulator on the Thor's
+            // top screen), MainActivity having just resumed there is itself proof the emulator
+            // was dismissed: its UsageStats timestamp is necessarily fresh, so isPackageInForeground
+            // would wrongly report it still running and strand the companion "game running" view
+            // until the 30s background monitor fires.
+            if (emulatorDisplayId != null && emulatorDisplayId != android.view.Display.DEFAULT_DISPLAY) {
                 val emulatorPkg = sessionStateStore.getEmulatorPackage() ?: return@launch
                 if (permissionHelper.isPackageInForeground(this@MainActivity, emulatorPkg, 15_000)) return@launch
             }
