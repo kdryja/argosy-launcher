@@ -193,6 +193,7 @@ class MainActivity : ComponentActivity() {
     private var hasResumedBefore = false
     private var hadFocusBefore = false
     private var focusLostTime = 0L
+    private var lastDisplacedRecoveryTime = 0L
 
     // --- Lifecycle ---
 
@@ -332,6 +333,11 @@ class MainActivity : ComponentActivity() {
         if (!handleDeepLink(intent)) {
             handleHomeIntent(intent)
         }
+        // A launcher tap on the secondary display doesn't create a new instance of this
+        // singleTask activity (so onCreate's redirect never runs) -- the system reparents
+        // the existing task onto that display and only delivers this intent. The reparent
+        // settles after onNewIntent returns, so check from the next frame.
+        window.decorView.post { recoverDisplacedTask() }
     }
 
     @SuppressLint("NewApi")
@@ -342,7 +348,12 @@ class MainActivity : ComponentActivity() {
 
         dualScreenManager.broadcastForegroundState(true)
 
-        cleanupStaleSession()
+        // While displaced onto the secondary display, this resume says nothing about the
+        // emulator on the default display -- cleanupStaleSession would treat it as proof
+        // the emulator was dismissed and wrongly end a live session.
+        if (!recoverDisplacedTask()) {
+            cleanupStaleSession()
+        }
         revalidateDownloadedFiles()
 
         if (hasResumedBefore) {
@@ -493,6 +504,13 @@ class MainActivity : ComponentActivity() {
         super.onWindowFocusChanged(hasFocus)
         Log.d(TAG, "onWindowFocusChanged: hasFocus=$hasFocus swapped=${if (::dualScreenManager.isInitialized) dualScreenManager.isRolesSwapped.value else "N/A"} gameActive=${if (::dualScreenManager.isInitialized) dualScreenManager.swappedIsGameActive.value else "N/A"}")
         if (hasFocus) {
+            // Catch a launcher-driven reparent onto the secondary display the moment the
+            // window actually lands there. onResume runs before getDisplay() reflects the
+            // move, so it only recovers a beat later -- long enough to flash the top screen
+            // blank. The window-focus callback fires once the window is attached to the new
+            // display, giving us the earliest reliable signal. Bail out of the normal
+            // focus handling while we bounce back.
+            if (recoverDisplacedTask()) return
             val timeSinceFocusLost = System.currentTimeMillis() - focusLostTime
             if (hadFocusBefore && focusLostTime > 0 && timeSinceFocusLost < 1000) {
                 gamepadInputHandler.emitHomeEvent()
@@ -544,6 +562,53 @@ class MainActivity : ComponentActivity() {
             runCatching { gameRepository.validateLocalFiles() }
                 .onFailure { Log.w(TAG, "revalidateDownloadedFiles failed", it) }
         }
+    }
+
+    /**
+     * Recovers from the task being reparented onto the secondary display. With the
+     * companion (bottom-screen) home dismissed, tapping Argosy in the secondary
+     * display's launcher targets that display -- and because MainActivity is
+     * singleTask, the system moves the existing task there instead of creating a
+     * new instance for onCreate's redirect to catch. The main UI lands on the
+     * bottom screen and the top screen falls back to the system home. Treat that
+     * launch as "bring my bottom screen back": send this task home to the default
+     * display and relaunch the companion where the user actually tapped.
+     *
+     * @return true if the task was displaced and recovery was kicked off.
+     */
+    @SuppressLint("NewApi")
+    private fun recoverDisplacedTask(): Boolean {
+        val displayId = display?.displayId ?: return false
+        if (displayId == Display.DEFAULT_DISPLAY) return false
+        if (!::dualScreenManager.isInitialized) return false
+        if (!sessionStateStore.isDualScreenEnabled()) return false
+        // Both onNewIntent and onResume probe for displacement; the move back to the
+        // default display is asynchronous, so the second probe can still see the old
+        // display. Debounce instead of re-firing the recovery intents.
+        val now = System.currentTimeMillis()
+        if (now - lastDisplacedRecoveryTime < 2000) return true
+        lastDisplacedRecoveryTime = now
+        Log.w(TAG, "Task displaced to display $displayId, moving back and restoring companion")
+        startActivity(
+            Intent(this, MainActivity::class.java).apply {
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_NO_ANIMATION
+                )
+            },
+            android.app.ActivityOptions.makeBasic()
+                .setLaunchDisplayId(Display.DEFAULT_DISPLAY)
+                .toBundle()
+        )
+        // Suppress the companion launch's refocusMain() bounce for a short window: we've
+        // just repositioned MainActivity on the default display ourselves, and whichever
+        // code path actually launches the companion would otherwise re-disturb the top
+        // screen ~300ms later (a second flicker).
+        dualScreenManager.suppressCompanionBounce()
+        dualScreenManager.ensureCompanionLaunched(allowDuringSession = true, immediate = true)
+        return true
     }
 
     private fun cleanupStaleSession() {

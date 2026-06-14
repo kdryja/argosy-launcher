@@ -1829,13 +1829,34 @@ class DualScreenManager(
         startupGuardJob = null
     }
 
-    fun ensureCompanionLaunched(allowDuringSession: Boolean = false) {
+    // While set to a future timestamp, the next companion launch skips its refocusMain()
+    // bounce. Displaced-task recovery sets this because it repositions MainActivity on the
+    // default display itself; the bounce would then re-disturb the top screen and read as a
+    // second flicker. A time window (rather than a consume-once flag) means a recovery that
+    // ends up not launching the companion can't leave a stale latch that swallows a later,
+    // legitimate bounce -- it simply expires.
+    private var suppressBounceUntilMs = 0L
+
+    fun suppressCompanionBounce(windowMs: Long = 3000L) {
+        suppressBounceUntilMs = System.currentTimeMillis() + windowMs
+    }
+
+    fun ensureCompanionLaunched(allowDuringSession: Boolean = false, immediate: Boolean = false) {
         if (!displayAffinityHelper.hasSecondaryDisplay) return
         if (_isCompanionActive.value) return
         if (!allowDuringSession && sessionStateStore.hasActiveSession()) return
 
         CompanionGuardService.start(appContext)
         companionLaunchJob?.cancel()
+        if (immediate) {
+            // Displaced-task recovery already knows the companion is gone and wants it back
+            // now -- the normal debounce just leaves the bottom screen on the system launcher
+            // for ~½s, which is the bulk of the visible misalignment. Launch synchronously so
+            // a competing debounced call can't cancel-and-replace this with a delayed one; if
+            // one races in, the companion is already active and its guard below no-ops.
+            launchCompanionOnSecondaryDisplay()
+            return
+        }
         companionLaunchJob = scope.launch {
             delay(COMPANION_LAUNCH_WAIT_MS)
             if (_isCompanionActive.value) return@launch
@@ -1855,9 +1876,14 @@ class DualScreenManager(
         }
         Log.d(TAG, "Launching companion on secondary display")
         activityContext.startActivity(intent, options)
-        scope.launch {
-            delay(300)
-            refocusMain()
+        // Suppress the bounce during a displaced-task recovery (see suppressBounceUntilMs).
+        // Whichever caller wins the companion-launch race, the refocusMain() is what we want
+        // to skip there -- recovery has already placed MainActivity on the default display.
+        if (System.currentTimeMillis() >= suppressBounceUntilMs) {
+            scope.launch {
+                delay(300)
+                refocusMain()
+            }
         }
     }
 
